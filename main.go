@@ -1,118 +1,159 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
-	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
-	"io/fs"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // For build-time overriding
 var bemenu = "bemenu"
 
-func rumenuPath() ([]string, error) {
-	var out []string
-	for _, d := range strings.Split(os.Getenv("PATH"), ":") {
-		files, _ := os.ReadDir(d)
-		for _, f := range files {
-			out = append(out, f.Name())
-		}
+var (
+	dataDir        = findDataDir()
+	countsFileName = dataDir + "/counts.json"
+)
+
+func findDataDir() string {
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		dataDir = os.Getenv("HOME") + "/.local/share"
 	}
+	dataDir += "/rumenu"
+	return dataDir
+}
+
+func rumenuPath() ([]string, error) {
+	wg := new(sync.WaitGroup)
+	dirs := strings.Split(os.Getenv("PATH"), ":")
+	dirContents := make([][]string, len(dirs))
+	for i, d := range dirs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			files, _ := os.ReadDir(d)
+			names := make([]string, len(files))
+			for j, f := range files {
+				names[j] = f.Name()
+			}
+			dirContents[i] = names
+		}()
+	}
+	wg.Wait()
+	out := slices.Concat(dirContents...)
 	if len(out) == 0 {
 		return nil, errors.New("no files")
 	}
 	return out, nil
 }
 
-func openDB(ctx context.Context, path string) (*sql.DB, error) {
-	_, err := os.Stat(path)
-	needInit := false
-	if errors.Is(err, fs.ErrNotExist) {
-		needInit = true
-	} else if err != nil {
-		return nil, fmt.Errorf("find DB file: %s", err)
-	}
-
-	db, err := sql.Open("sqlite3", path)
+func readFreq() (map[string]int, error) {
+	countsFile, err := os.Open(countsFileName)
 	if err != nil {
-		return nil, fmt.Errorf("open DB: %s", err)
+		return nil, fmt.Errorf("read counts: %s", err)
 	}
-	if needInit {
-		if _, err := db.ExecContext(ctx, `
-			CREATE TABLE RecentlyUsed (
-				Entry TEXT NOT NULL PRIMARY KEY,
-				Count INTEGER NOT NULL
-			) STRICT`,
-		); err != nil {
-			return nil, fmt.Errorf("init DB: %s", err)
-		}
-	}
-	return db, nil
+	defer countsFile.Close()
+	counts := make(map[string]int)
+	err = json.NewDecoder(countsFile).Decode(&counts)
+	return counts, err
 }
 
-func readFreq(ctx context.Context, db *sql.DB) (map[string]int, error) {
-	rows, err := db.QueryContext(ctx, "SELECT Entry, Count FROM RecentlyUsed")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	freq := make(map[string]int)
-	for rows.Next() {
-		var (
-			entry string
-			count int
-		)
-		if err := rows.Scan(&entry, &count); err != nil {
-			return nil, err
-		}
-		freq[entry] = count
-	}
-	return freq, rows.Err()
-}
+type sortedMap map[string]int
 
-func run(ctx context.Context) error {
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		dataDir = os.Getenv("HOME") + "/.local/share"
+func (m sortedMap) MarshalJSON() ([]byte, error) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-
-	_, err := os.Stat(dataDir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.MkdirAll(dataDir, 0755); err != nil {
-			return fmt.Errorf("make data dir: %s", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("find data dir: %s", err)
-	}
-
-	db, err := openDB(ctx, dataDir+"/rumenu.sqlite")
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	freq, err := readFreq(ctx, db)
-	if err != nil {
-		return fmt.Errorf("read recently used counts: %s", err)
-	}
-
-	progs, err := rumenuPath()
-	if err != nil {
-		return err
-	}
-	slices.SortFunc(progs, func(x, y string) int {
-		if n := cmp.Compare(freq[x], freq[y]); n != 0 {
-			return -n
+	slices.SortFunc(keys, func(x, y string) int {
+		if n := cmp.Compare(m[y], m[x]); n != 0 {
+			return n
 		}
 		return strings.Compare(x, y)
 	})
+	buf := new(bytes.Buffer)
+	encoder := json.NewEncoder(buf)
+	buf.WriteString("{")
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteString(",")
+		}
+		if err := encoder.Encode(k); err != nil {
+			return nil, err
+		}
+		buf.WriteString(":")
+		if err := encoder.Encode(m[k]); err != nil {
+			return nil, err
+		}
+	}
+	buf.WriteString("}")
+	return buf.Bytes(), nil
+}
+
+func writeFreq(freq map[string]int) error {
+	tempFile, err := os.CreateTemp(dataDir, "")
+	if err != nil {
+		return fmt.Errorf("write counts: %s", err)
+	}
+	encoder := json.NewEncoder(tempFile)
+	encoder.SetIndent("", "\t")
+	if err := encoder.Encode(sortedMap(freq)); err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+		return fmt.Errorf("write counts: %s", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		os.Remove(tempFile.Name())
+		return fmt.Errorf("write counts: %s", err)
+	}
+	if err := os.Rename(tempFile.Name(), countsFileName); err != nil {
+		os.Remove(tempFile.Name())
+		return fmt.Errorf("write counts: %s", err)
+	}
+	return nil
+}
+
+func run(ctx context.Context) error {
+	wg := new(sync.WaitGroup)
+
+	var freq map[string]int
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		if freq, err = readFreq(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", err)
+		}
+	}()
+
+	var progs []string
+	var err error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		progs, err = rumenuPath()
+	}()
+
+	wg.Wait()
+	if err != nil {
+		return err
+	}
+
+	compareProgs := func(x, y string) int {
+		if n := cmp.Compare(freq[y], freq[x]); n != 0 {
+			return n
+		}
+		return strings.Compare(x, y)
+	}
+	slices.SortFunc(progs, compareProgs)
 
 	bemenu := exec.CommandContext(ctx, bemenu)
 	bemenu.Stdin = strings.NewReader(strings.Join(progs, "\n") + "\n")
@@ -125,24 +166,44 @@ func run(ctx context.Context) error {
 		return nil
 	}
 
-	if _, err := db.ExecContext(ctx, `
-		INSERT INTO RecentlyUsed (Entry, Count) VALUES (?, 1)
-		ON CONFLICT DO UPDATE SET Count = Count + 1`,
-		choice,
-	); err != nil {
-		return fmt.Errorf("update DB: %s", err)
-	}
+	var progErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/sh"
+		}
+		sh := exec.CommandContext(ctx, shell)
+		sh.Stdin = strings.NewReader(choice + "\n")
+		if err := sh.Run(); err != nil {
+			progErr = fmt.Errorf("%s: %w", choice, err)
+		}
+	}()
 
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
+	var writeFreqErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if writeFreqErr = os.MkdirAll(dataDir, 0755); writeFreqErr != nil {
+			return
+		}
+
+		if _, ok := slices.BinarySearchFunc(progs, choice, compareProgs); !ok {
+			return
+		}
+		if freq == nil {
+			freq = make(map[string]int)
+		}
+		freq[choice]++
+		writeFreqErr = writeFreq(freq)
+	}()
+
+	wg.Wait()
+	if progErr != nil {
+		return progErr
 	}
-	sh := exec.CommandContext(ctx, shell)
-	sh.Stdin = strings.NewReader(choice)
-	if err := sh.Run(); err != nil {
-		return fmt.Errorf("start program %q: %s", choice, err)
-	}
-	return nil
+	return writeFreqErr
 }
 
 func main() {
@@ -153,6 +214,6 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
-		os.Exit(1)
+		os.Exit(255)
 	}
 }

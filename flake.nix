@@ -48,7 +48,7 @@
             # remember to bump this hash when your dependencies change.
             # vendorHash = pkgs.lib.fakeHash;
 
-            vendorHash = "sha256-WA7PLEaT7lpBkIQHXbRSrQO7mfip4mRS7xMck6lVAFs=";
+            vendorHash = null;
 
             ldflags = [
               "-X main.bemenu=${pkgs.bemenu}/bin/bemenu"
