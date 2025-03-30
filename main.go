@@ -1,15 +1,15 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -19,7 +19,7 @@ var bemenu = "bemenu"
 
 var (
 	dataDir        = findDataDir()
-	countsFileName = dataDir + "/counts"
+	countsFileName = dataDir + "/counts.json"
 )
 
 func findDataDir() string {
@@ -56,55 +56,60 @@ func rumenuPath() ([]string, error) {
 }
 
 func readFreq() (map[string]int, error) {
-	countsFile, err := os.Open(countsFileName)
+	countsBytes, err := os.ReadFile(countsFileName)
 	if err != nil {
 		return nil, fmt.Errorf("read counts: %s", err)
 	}
-	defer countsFile.Close()
 	counts := make(map[string]int)
-	lineNum := 0
-	scanner := bufio.NewScanner(countsFile)
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-		i := strings.LastIndex(line, "\t")
-		if i < 0 {
-			return counts, fmt.Errorf("error parsing counts file %q line %d", countsFileName, lineNum)
-		}
-		name, countStr := line[:i], line[i+1:]
-		count, err := strconv.Atoi(countStr)
-		if err != nil {
-			return counts, fmt.Errorf("error parsing counts file %q line %d", countsFileName, lineNum)
-		}
-		counts[name] = count
-	}
-	return counts, scanner.Err()
+	err = json.Unmarshal(countsBytes, &counts)
+	return counts, err
 }
 
-func writeFreq(freq map[string]int) error {
-	tempFile, err := os.CreateTemp(dataDir, "")
-	if err != nil {
-		return fmt.Errorf("write counts: %s", err)
-	}
-	keys := make([]string, 0, len(freq))
-	for k := range freq {
+type sortedMap map[string]int
+
+func (m sortedMap) MarshalJSON() ([]byte, error) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
 		keys = append(keys, k)
 	}
 	slices.SortFunc(keys, func(x, y string) int {
-		if n := cmp.Compare(freq[y], freq[x]); n != 0 {
+		if n := cmp.Compare(m[y], m[x]); n != 0 {
 			return n
 		}
 		return strings.Compare(x, y)
 	})
-	w := bufio.NewWriter(tempFile)
-	for _, k := range keys {
-		if _, err := fmt.Fprintf(w, "%s\t%d\n", k, freq[k]); err != nil {
-			tempFile.Close()
-			os.Remove(tempFile.Name())
-			return fmt.Errorf("write counts: %s", err)
+	buf := new(bytes.Buffer)
+	buf.WriteString("{")
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteString(",")
 		}
+		kJSON, err := json.Marshal(k)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(kJSON)
+		buf.WriteString(":")
+		val, err := json.Marshal(m[k])
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(val)
 	}
-	if err := w.Flush(); err != nil {
+	buf.WriteString("}")
+	return buf.Bytes(), nil
+}
+
+func writeFreq(freq map[string]int) error {
+	freqJSON, err := json.MarshalIndent(sortedMap(freq), "", " ")
+	if err != nil {
+		return fmt.Errorf("write counts: %s", err)
+	}
+	tempFile, err := os.CreateTemp(dataDir, "")
+	if err != nil {
+		return fmt.Errorf("write counts: %s", err)
+	}
+	if _, err := tempFile.Write(append(freqJSON, '\n')); err != nil {
 		tempFile.Close()
 		os.Remove(tempFile.Name())
 		return fmt.Errorf("write counts: %s", err)
