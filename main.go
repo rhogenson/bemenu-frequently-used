@@ -1,15 +1,15 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -19,7 +19,7 @@ var bemenu = "bemenu"
 
 var (
 	dataDir        = findDataDir()
-	countsFileName = dataDir + "/counts.json"
+	countsFileName = dataDir + "/counts"
 )
 
 func findDataDir() string {
@@ -62,40 +62,23 @@ func readFreq() (map[string]int, error) {
 	}
 	defer countsFile.Close()
 	counts := make(map[string]int)
-	err = json.NewDecoder(countsFile).Decode(&counts)
-	return counts, err
-}
-
-type sortedMap map[string]int
-
-func (m sortedMap) MarshalJSON() ([]byte, error) {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	lineNum := 0
+	scanner := bufio.NewScanner(countsFile)
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+		i := strings.LastIndex(line, "\t")
+		if i < 0 {
+			return counts, fmt.Errorf("error parsing counts file %q line %d", countsFileName, lineNum)
+		}
+		name, countStr := line[:i], line[i+1:]
+		count, err := strconv.Atoi(countStr)
+		if err != nil {
+			return counts, fmt.Errorf("error parsing counts file %q line %d", countsFileName, lineNum)
+		}
+		counts[name] = count
 	}
-	slices.SortFunc(keys, func(x, y string) int {
-		if n := cmp.Compare(m[y], m[x]); n != 0 {
-			return n
-		}
-		return strings.Compare(x, y)
-	})
-	buf := new(bytes.Buffer)
-	encoder := json.NewEncoder(buf)
-	buf.WriteString("{")
-	for i, k := range keys {
-		if i > 0 {
-			buf.WriteString(",")
-		}
-		if err := encoder.Encode(k); err != nil {
-			return nil, err
-		}
-		buf.WriteString(":")
-		if err := encoder.Encode(m[k]); err != nil {
-			return nil, err
-		}
-	}
-	buf.WriteString("}")
-	return buf.Bytes(), nil
+	return counts, scanner.Err()
 }
 
 func writeFreq(freq map[string]int) error {
@@ -103,9 +86,25 @@ func writeFreq(freq map[string]int) error {
 	if err != nil {
 		return fmt.Errorf("write counts: %s", err)
 	}
-	encoder := json.NewEncoder(tempFile)
-	encoder.SetIndent("", "\t")
-	if err := encoder.Encode(sortedMap(freq)); err != nil {
+	keys := make([]string, 0, len(freq))
+	for k := range freq {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(x, y string) int {
+		if n := cmp.Compare(freq[y], freq[x]); n != 0 {
+			return n
+		}
+		return strings.Compare(x, y)
+	})
+	w := bufio.NewWriter(tempFile)
+	for _, k := range keys {
+		if _, err := fmt.Fprintf(w, "%s\t%d\n", k, freq[k]); err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return fmt.Errorf("write counts: %s", err)
+		}
+	}
+	if err := w.Flush(); err != nil {
 		tempFile.Close()
 		os.Remove(tempFile.Name())
 		return fmt.Errorf("write counts: %s", err)
