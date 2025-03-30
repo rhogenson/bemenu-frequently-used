@@ -1,15 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -19,7 +20,7 @@ var bemenu = "bemenu"
 
 var (
 	dataDir        = findDataDir()
-	countsFileName = dataDir + "/counts.json"
+	countsFileName = dataDir + "/counts"
 )
 
 func findDataDir() string {
@@ -40,9 +41,11 @@ func rumenuPath() ([]string, error) {
 		go func() {
 			defer wg.Done()
 			files, _ := os.ReadDir(d)
-			names := make([]string, len(files))
-			for j, f := range files {
-				names[j] = f.Name()
+			names := make([]string, 0, len(files))
+			for _, f := range files {
+				if name := f.Name(); !strings.Contains(name, "\n") {
+					names = append(names, name)
+				}
 			}
 			dirContents[i] = names
 		}()
@@ -56,70 +59,65 @@ func rumenuPath() ([]string, error) {
 }
 
 func readFreq() (map[string]int, error) {
-	countsBytes, err := os.ReadFile(countsFileName)
+	countsFile, err := os.Open(countsFileName)
 	if err != nil {
-		return nil, fmt.Errorf("read counts: %s", err)
+		return nil, err
 	}
+	defer countsFile.Close()
 	counts := make(map[string]int)
-	err = json.Unmarshal(countsBytes, &counts)
-	return counts, err
+	lineNum := 0
+	scanner := bufio.NewScanner(countsFile)
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+		i := strings.LastIndex(line, "\t")
+		if i < 0 {
+			return counts, fmt.Errorf("%s:%d invalid syntax", countsFileName, lineNum)
+		}
+		name, countStr := line[:i], line[i+1:]
+		count, err := strconv.Atoi(countStr)
+		if err != nil {
+			return counts, fmt.Errorf("%s:%d invalid syntax: %s", countsFileName, lineNum, err)
+		}
+		counts[name] = count
+	}
+	return counts, scanner.Err()
 }
 
-type sortedMap map[string]int
-
-func (m sortedMap) MarshalJSON() ([]byte, error) {
-	keys := make([]string, 0, len(m))
-	for k := range m {
+func writeFreq(freq map[string]int) (err error) {
+	keys := make([]string, 0, len(freq))
+	for k := range freq {
 		keys = append(keys, k)
 	}
 	slices.SortFunc(keys, func(x, y string) int {
-		if n := cmp.Compare(m[y], m[x]); n != 0 {
+		if n := cmp.Compare(freq[y], freq[x]); n != 0 {
 			return n
 		}
 		return strings.Compare(x, y)
 	})
-	buf := new(bytes.Buffer)
-	buf.WriteString("{")
-	for i, k := range keys {
-		if i > 0 {
-			buf.WriteString(",")
-		}
-		kJSON, err := json.Marshal(k)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(kJSON)
-		buf.WriteString(":")
-		val, err := json.Marshal(m[k])
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(val)
-	}
-	buf.WriteString("}")
-	return buf.Bytes(), nil
-}
-
-func writeFreq(freq map[string]int) error {
-	freqJSON, err := json.MarshalIndent(sortedMap(freq), "", " ")
-	if err != nil {
-		return fmt.Errorf("write counts: %s", err)
-	}
 	tempFile, err := os.CreateTemp(dataDir, "")
 	if err != nil {
 		return fmt.Errorf("write counts: %s", err)
 	}
-	if _, err := tempFile.Write(append(freqJSON, '\n')); err != nil {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
+	defer func() {
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+		}
+	}()
+	w := bufio.NewWriter(tempFile)
+	for _, k := range keys {
+		if _, err := fmt.Fprintf(w, "%s\t%d\n", k, freq[k]); err != nil {
+			return fmt.Errorf("write counts: %s", err)
+		}
+	}
+	if err := w.Flush(); err != nil {
 		return fmt.Errorf("write counts: %s", err)
 	}
 	if err := tempFile.Close(); err != nil {
-		os.Remove(tempFile.Name())
 		return fmt.Errorf("write counts: %s", err)
 	}
 	if err := os.Rename(tempFile.Name(), countsFileName); err != nil {
-		os.Remove(tempFile.Name())
 		return fmt.Errorf("write counts: %s", err)
 	}
 	return nil
@@ -165,7 +163,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("bemenu: %w", err)
 	}
-	choice := strings.TrimSuffix(string(choiceBytes), "\n")
+	choice := string(bytes.TrimSuffix(choiceBytes, []byte("\n")))
 	if choice == "" {
 		return nil
 	}
@@ -180,6 +178,8 @@ func run(ctx context.Context) error {
 		}
 		sh := exec.CommandContext(ctx, shell)
 		sh.Stdin = strings.NewReader(choice + "\n")
+		sh.Stdout = os.Stdout
+		sh.Stderr = os.Stderr
 		if err := sh.Run(); err != nil {
 			progErr = fmt.Errorf("%s: %w", choice, err)
 		}
