@@ -1,5 +1,5 @@
 {
-  description = "Like dmenu, but sorted by recently used";
+  description = "Like dmenu, but sorted by frequently used";
 
   # Nixpkgs / NixOS version to use.
   inputs.nixpkgs.url = "nixpkgs/nixos-unstable";
@@ -31,8 +31,8 @@
           pkgs = nixpkgsFor.${system};
         in
         {
-          bemenu-recently-used = pkgs.buildGoModule {
-            pname = "bemenu-recently-used";
+          bemenu-frequently-used = pkgs.buildGoModule {
+            pname = "bemenu-frequently-used";
             inherit version;
             # In 'nix develop', we don't need a copy of the source tree
             # in the Nix store.
@@ -55,7 +55,7 @@
             ];
 
             postInstall = ''
-              mv $out/bin/bemenu-{recently-used,run}
+              mv $out/bin/bemenu-{frequently-used,run}
             '';
           };
         });
@@ -74,6 +74,6 @@
       # The default package for 'nix build'. This makes sense if the
       # flake provides only one package or there is a clear "main"
       # package.
-      defaultPackage = forAllSystems (system: self.packages.${system}.bemenu-recently-used);
+      defaultPackage = forAllSystems (system: self.packages.${system}.bemenu-frequently-used);
     };
 }

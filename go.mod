@@ -1,3 +1,3 @@
-module github.com/rhogenson/bemenu-recently-used
+module github.com/rhogenson/bemenu-frequently-used
 
 go 1.22.3
