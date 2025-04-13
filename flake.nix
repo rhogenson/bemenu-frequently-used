@@ -31,8 +31,8 @@
           pkgs = nixpkgsFor.${system};
         in
         {
-          rumenu = pkgs.buildGoModule {
-            pname = "rumenu";
+          bemenu-recently-used = pkgs.buildGoModule {
+            pname = "bemenu-recently-used";
             inherit version;
             # In 'nix develop', we don't need a copy of the source tree
             # in the Nix store.
@@ -53,6 +53,10 @@
             ldflags = [
               "-X main.bemenu=${pkgs.bemenu}/bin/bemenu"
             ];
+
+            postInstall = ''
+              mv $out/bin/bemenu-{recently-used,run}
+            '';
           };
         });
 
@@ -70,6 +74,6 @@
       # The default package for 'nix build'. This makes sense if the
       # flake provides only one package or there is a clear "main"
       # package.
-      defaultPackage = forAllSystems (system: self.packages.${system}.rumenu);
+      defaultPackage = forAllSystems (system: self.packages.${system}.bemenu-recently-used);
     };
 }
